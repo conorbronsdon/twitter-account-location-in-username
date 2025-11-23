@@ -1,14 +1,10 @@
 // Cache for user locations - persistent storage
 let locationCache = new Map();
-const CACHE_KEY = 'twitter_location_cache';
-const CACHE_EXPIRY_DAYS = 30; // Cache for 30 days
 
 // Rate limiting
 const requestQueue = [];
 let isProcessingQueue = false;
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 2000; // 2 seconds between requests (increased to avoid rate limits)
-const MAX_CONCURRENT_REQUESTS = 2; // Reduced concurrent requests
 let activeRequests = 0;
 let rateLimitResetTime = 0; // Unix timestamp when rate limit resets
 
@@ -18,8 +14,6 @@ let navigationObserver = null;
 
 // Extension enabled state
 let extensionEnabled = true;
-const TOGGLE_KEY = 'extension_enabled';
-const DEFAULT_ENABLED = true;
 
 // Track usernames currently being processed to avoid duplicate requests
 const processingUsernames = new Set();
@@ -62,15 +56,19 @@ const debug = {
   }
 };
 
-// Load enabled state
+/**
+ * Load extension enabled state from Chrome storage
+ * @async
+ * @returns {Promise<void>}
+ */
 async function loadEnabledState() {
   try {
-    const result = await chrome.storage.local.get([TOGGLE_KEY]);
-    extensionEnabled = result[TOGGLE_KEY] !== undefined ? result[TOGGLE_KEY] : DEFAULT_ENABLED;
+    const result = await chrome.storage.local.get([CONFIG.STATE.TOGGLE_KEY]);
+    extensionEnabled = result[CONFIG.STATE.TOGGLE_KEY] !== undefined ? result[CONFIG.STATE.TOGGLE_KEY] : CONFIG.STATE.DEFAULT_ENABLED;
     console.log('Extension enabled:', extensionEnabled);
   } catch (error) {
     console.error('Error loading enabled state:', error);
-    extensionEnabled = DEFAULT_ENABLED;
+    extensionEnabled = CONFIG.STATE.DEFAULT_ENABLED;
   }
 }
 
@@ -92,7 +90,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
-// Load cache from persistent storage
+/**
+ * Load location cache from Chrome storage
+ * Filters out expired entries and null values
+ * @async
+ * @returns {Promise<void>}
+ */
 async function loadCache() {
   try {
     // Check if extension context is still valid
@@ -100,12 +103,12 @@ async function loadCache() {
       console.log('Extension context invalidated, skipping cache load');
       return;
     }
-    
-    const result = await chrome.storage.local.get(CACHE_KEY);
-    if (result[CACHE_KEY]) {
-      const cached = result[CACHE_KEY];
+
+    const result = await chrome.storage.local.get(CONFIG.CACHE.KEY);
+    if (result[CONFIG.CACHE.KEY]) {
+      const cached = result[CONFIG.CACHE.KEY];
       const now = Date.now();
-      
+
       // Filter out expired entries and null entries (allow retry)
       for (const [username, data] of Object.entries(cached)) {
         if (data.expiry && data.expiry > now && data.location !== null) {
@@ -116,7 +119,7 @@ async function loadCache() {
     }
   } catch (error) {
     // Extension context invalidated errors are expected when extension is reloaded
-    if (error.message?.includes('Extension context invalidated') || 
+    if (error.message?.includes('Extension context invalidated') ||
         error.message?.includes('message port closed')) {
       console.log('Extension context invalidated, cache load skipped');
     } else {
@@ -125,7 +128,11 @@ async function loadCache() {
   }
 }
 
-// Save cache to persistent storage
+/**
+ * Save location cache to Chrome storage with expiry timestamps
+ * @async
+ * @returns {Promise<void>}
+ */
 async function saveCache() {
   try {
     // Check if extension context is still valid
@@ -133,11 +140,11 @@ async function saveCache() {
       console.log('Extension context invalidated, skipping cache save');
       return;
     }
-    
+
     const cacheObj = {};
     const now = Date.now();
-    const expiry = now + (CACHE_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
-    
+    const expiry = now + (CONFIG.CACHE.EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+
     for (const [username, location] of locationCache.entries()) {
       cacheObj[username] = {
         location: location,
@@ -145,11 +152,11 @@ async function saveCache() {
         cachedAt: now
       };
     }
-    
-    await chrome.storage.local.set({ [CACHE_KEY]: cacheObj });
+
+    await chrome.storage.local.set({ [CONFIG.CACHE.KEY]: cacheObj });
   } catch (error) {
     // Extension context invalidated errors are expected when extension is reloaded
-    if (error.message?.includes('Extension context invalidated') || 
+    if (error.message?.includes('Extension context invalidated') ||
         error.message?.includes('message port closed')) {
       console.log('Extension context invalidated, cache save skipped');
     } else {
@@ -158,7 +165,13 @@ async function saveCache() {
   }
 }
 
-// Save a single entry to cache
+/**
+ * Save a single cache entry with debouncing
+ * @async
+ * @param {string} username - Twitter username
+ * @param {string|null} location - User location or null if not found
+ * @returns {Promise<void>}
+ */
 async function saveCacheEntry(username, location) {
   // Check if extension context is still valid
   if (!chrome.runtime?.id) {
@@ -167,16 +180,20 @@ async function saveCacheEntry(username, location) {
   }
   
   locationCache.set(username, location);
-  // Debounce saves - only save every 5 seconds
+  // Debounce saves
   if (!saveCache.timeout) {
     saveCache.timeout = setTimeout(async () => {
       await saveCache();
       saveCache.timeout = null;
-    }, 5000);
+    }, CONFIG.CACHE.SAVE_DEBOUNCE_MS);
   }
 }
 
-// Inject script into page context to access fetch with proper cookies
+/**
+ * Inject page script into the page context to intercept Twitter API headers
+ * and make authenticated API requests
+ * @returns {void}
+ */
 function injectPageScript() {
   const script = document.createElement('script');
   script.src = chrome.runtime.getURL('pageScript.js');
@@ -196,7 +213,12 @@ function injectPageScript() {
   });
 }
 
-// Process request queue with rate limiting
+/**
+ * Process the request queue with rate limiting and concurrency control
+ * Respects MIN_REQUEST_INTERVAL_MS and MAX_CONCURRENT_REQUESTS
+ * @async
+ * @returns {Promise<void>}
+ */
 async function processRequestQueue() {
   if (isProcessingQueue || requestQueue.length === 0) {
     return;
@@ -218,13 +240,13 @@ async function processRequestQueue() {
   
   isProcessingQueue = true;
   
-  while (requestQueue.length > 0 && activeRequests < MAX_CONCURRENT_REQUESTS) {
+  while (requestQueue.length > 0 && activeRequests < CONFIG.RATE_LIMIT.MAX_CONCURRENT_REQUESTS) {
     const now = Date.now();
     const timeSinceLastRequest = now - lastRequestTime;
-    
+
     // Wait if needed to respect rate limit
-    if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
-      await new Promise(resolve => setTimeout(resolve, MIN_REQUEST_INTERVAL - timeSinceLastRequest));
+    if (timeSinceLastRequest < CONFIG.RATE_LIMIT.MIN_REQUEST_INTERVAL_MS) {
+      await new Promise(resolve => setTimeout(resolve, CONFIG.RATE_LIMIT.MIN_REQUEST_INTERVAL_MS - timeSinceLastRequest));
     }
     
     const { screenName, resolve, reject } = requestQueue.shift();
@@ -249,7 +271,11 @@ async function processRequestQueue() {
   isProcessingQueue = false;
 }
 
-// Make actual API request
+/**
+ * Make an API request for a user's location via page script
+ * @param {string} screenName - Twitter username
+ * @returns {Promise<string|null>} Location string or null
+ */
 function makeLocationRequest(screenName) {
   return new Promise((resolve, reject) => {
     const requestId = Date.now() + Math.random();
@@ -286,17 +312,22 @@ function makeLocationRequest(screenName) {
       requestId
     }, '*');
     
-    // Timeout after 10 seconds
+    // Timeout
     setTimeout(() => {
       window.removeEventListener('message', handler);
       // Don't cache timeout failures - allow retry
       console.log(`Request timeout for ${screenName}, not caching`);
       resolve(null);
-    }, 10000);
+    }, CONFIG.API.TIMEOUT);
   });
 }
 
-// Function to query Twitter GraphQL API for user location (with rate limiting)
+/**
+ * Query Twitter GraphQL API for user location with caching and rate limiting
+ * @async
+ * @param {string} screenName - Twitter username
+ * @returns {Promise<string|null>} Location string or null if not found
+ */
 async function getUserLocation(screenName) {
   // Check cache first
   if (locationCache.has(screenName)) {
@@ -320,7 +351,12 @@ async function getUserLocation(screenName) {
   });
 }
 
-// Function to extract username from various Twitter UI elements
+/**
+ * Extract Twitter username from various UI elements
+ * Handles multiple DOM structures and filters out invalid routes
+ * @param {Element} element - DOM element containing username
+ * @returns {string|null} Username without @ symbol, or null if not found
+ */
 function extractUsername(element) {
   // Try data-testid="UserName" or "User-Name" first (most reliable)
   const usernameElement = element.querySelector('[data-testid="UserName"], [data-testid="User-Name"]');
@@ -332,12 +368,11 @@ function extractUsername(element) {
       if (match && match[1]) {
         const username = match[1];
         // Filter out common routes
-        const excludedRoutes = ['home', 'explore', 'notifications', 'messages', 'i', 'compose', 'search', 'settings', 'bookmarks', 'lists', 'communities'];
-        if (!excludedRoutes.includes(username) && 
+        if (!CONFIG.USERNAME.EXCLUDED_ROUTES.includes(username) &&
             !username.startsWith('hashtag') &&
             !username.startsWith('search') &&
-            username.length > 0 &&
-            username.length < 20) { // Usernames are typically short
+            username.length >= CONFIG.USERNAME.MIN_LENGTH &&
+            username.length <= CONFIG.USERNAME.MAX_LENGTH) {
           return username;
         }
       }
@@ -362,8 +397,7 @@ function extractUsername(element) {
     seenUsernames.add(potentialUsername);
     
     // Filter out routes and invalid usernames
-    const excludedRoutes = ['home', 'explore', 'notifications', 'messages', 'i', 'compose', 'search', 'settings', 'bookmarks', 'lists', 'communities', 'hashtag'];
-    if (excludedRoutes.some(route => potentialUsername === route || potentialUsername.startsWith(route))) {
+    if (CONFIG.USERNAME.EXCLUDED_ROUTES.some(route => potentialUsername === route || potentialUsername.startsWith(route))) {
       continue;
     }
     
@@ -391,7 +425,9 @@ function extractUsername(element) {
     const parent = link.closest('[data-testid="UserName"], [data-testid="User-Name"]');
     if (parent) {
       // If it's in a UserName container and looks like a username, return it
-      if (potentialUsername.length > 0 && potentialUsername.length < 20 && !potentialUsername.includes('/')) {
+      if (potentialUsername.length >= CONFIG.USERNAME.MIN_LENGTH &&
+          potentialUsername.length <= CONFIG.USERNAME.MAX_LENGTH &&
+          !potentialUsername.includes('/')) {
         return potentialUsername;
       }
     }
@@ -424,7 +460,12 @@ function extractUsername(element) {
   return null;
 }
 
-// Helper function to find handle section
+/**
+ * Find the DOM element containing the @username handle
+ * @param {Element} container - Parent container element
+ * @param {string} screenName - Twitter username
+ * @returns {Element|undefined} Handle section element or undefined
+ */
 function findHandleSection(container, screenName) {
   return Array.from(container.querySelectorAll('div')).find(div => {
     const link = div.querySelector(`a[href="/${screenName}"]`);
@@ -436,25 +477,28 @@ function findHandleSection(container, screenName) {
   });
 }
 
-// Create loading shimmer placeholder
+/**
+ * Create a loading shimmer placeholder element
+ * @returns {HTMLSpanElement} Shimmer span element
+ */
 function createLoadingShimmer() {
   const shimmer = document.createElement('span');
-  shimmer.setAttribute('data-twitter-flag-shimmer', 'true');
+  shimmer.setAttribute(SELECTORS.FLAG_SHIMMER_ATTR, 'true');
   shimmer.style.display = 'inline-block';
-  shimmer.style.width = '20px';
-  shimmer.style.height = '16px';
-  shimmer.style.marginLeft = '4px';
-  shimmer.style.marginRight = '4px';
-  shimmer.style.verticalAlign = 'middle';
-  shimmer.style.borderRadius = '2px';
+  shimmer.style.width = CONFIG.UI.SHIMMER_WIDTH;
+  shimmer.style.height = CONFIG.UI.SHIMMER_HEIGHT;
+  shimmer.style.marginLeft = CONFIG.UI.FLAG_MARGIN_LEFT;
+  shimmer.style.marginRight = CONFIG.UI.FLAG_MARGIN_RIGHT;
+  shimmer.style.verticalAlign = CONFIG.UI.FLAG_VERTICAL_ALIGN;
+  shimmer.style.borderRadius = CONFIG.UI.SHIMMER_BORDER_RADIUS;
   shimmer.style.background = 'linear-gradient(90deg, rgba(113, 118, 123, 0.2) 25%, rgba(113, 118, 123, 0.4) 50%, rgba(113, 118, 123, 0.2) 75%)';
   shimmer.style.backgroundSize = '200% 100%';
-  shimmer.style.animation = 'shimmer 1.5s infinite';
-  
+  shimmer.style.animation = `shimmer ${CONFIG.UI.SHIMMER_ANIMATION_DURATION} infinite`;
+
   // Add animation keyframes if not already added
-  if (!document.getElementById('twitter-flag-shimmer-style')) {
+  if (!document.getElementById(SELECTORS.SHIMMER_STYLE_ID)) {
     const style = document.createElement('style');
-    style.id = 'twitter-flag-shimmer-style';
+    style.id = SELECTORS.SHIMMER_STYLE_ID;
     style.textContent = `
       @keyframes shimmer {
         0% {
@@ -467,11 +511,18 @@ function createLoadingShimmer() {
     `;
     document.head.appendChild(style);
   }
-  
+
   return shimmer;
 }
 
-// Function to add flag to username element
+/**
+ * Add country flag emoji to a username element
+ * Fetches location, finds country flag, and inserts it in the appropriate position
+ * @async
+ * @param {Element} usernameElement - DOM element containing the username
+ * @param {string} screenName - Twitter username
+ * @returns {Promise<void>}
+ */
 async function addFlagToUsername(usernameElement, screenName) {
   // Check if flag already added
   if (usernameElement.dataset.flagAdded === 'true') {
@@ -481,7 +532,7 @@ async function addFlagToUsername(usernameElement, screenName) {
   // Check if this username is already being processed (prevent duplicate API calls)
   if (processingUsernames.has(screenName)) {
     // Wait a bit and check if flag was added by the other process
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await new Promise(resolve => setTimeout(resolve, CONFIG.PROCESSING.DUPLICATE_CHECK_DELAY_MS));
     if (usernameElement.dataset.flagAdded === 'true') {
       return;
     }
@@ -645,7 +696,7 @@ async function addFlagToUsername(usernameElement, screenName) {
   console.log(`Found username link for ${screenName}:`, usernameLink.href, usernameLink.textContent?.trim());
 
   // Check if flag already exists (check in the entire container, not just parent)
-  const existingFlag = usernameElement.querySelector('[data-twitter-flag]');
+  const existingFlag = usernameElement.querySelector(`[${SELECTORS.FLAG_ATTR}]`);
   if (existingFlag) {
     // Remove shimmer if flag already exists
     if (shimmerInserted && shimmerSpan.parentNode) {
@@ -658,12 +709,12 @@ async function addFlagToUsername(usernameElement, screenName) {
   // Add flag emoji - place it next to verification badge, before @ handle
   const flagSpan = document.createElement('span');
   flagSpan.textContent = ` ${flag}`;
-  flagSpan.setAttribute('data-twitter-flag', 'true');
-  flagSpan.style.marginLeft = '4px';
-  flagSpan.style.marginRight = '4px';
-  flagSpan.style.display = 'inline';
+  flagSpan.setAttribute(SELECTORS.FLAG_ATTR, 'true');
+  flagSpan.style.marginLeft = CONFIG.UI.FLAG_MARGIN_LEFT;
+  flagSpan.style.marginRight = CONFIG.UI.FLAG_MARGIN_RIGHT;
+  flagSpan.style.display = CONFIG.UI.FLAG_DISPLAY;
   flagSpan.style.color = 'inherit';
-  flagSpan.style.verticalAlign = 'middle';
+  flagSpan.style.verticalAlign = CONFIG.UI.FLAG_VERTICAL_ALIGN;
   
   // Use userNameContainer found above, or find it if not found
   const containerForFlag = userNameContainer || usernameElement.querySelector('[data-testid="UserName"], [data-testid="User-Name"]');
@@ -794,25 +845,34 @@ async function addFlagToUsername(usernameElement, screenName) {
   }
 }
 
-// Function to remove all flags (when extension is disabled)
+/**
+ * Remove all flags and shimmers from the page
+ * Called when extension is disabled
+ * @returns {void}
+ */
 function removeAllFlags() {
-  const flags = document.querySelectorAll('[data-twitter-flag]');
+  const flags = document.querySelectorAll(`[${SELECTORS.FLAG_ATTR}]`);
   flags.forEach(flag => flag.remove());
-  
+
   // Also remove any loading shimmers
-  const shimmers = document.querySelectorAll('[data-twitter-flag-shimmer]');
+  const shimmers = document.querySelectorAll(`[${SELECTORS.FLAG_SHIMMER_ATTR}]`);
   shimmers.forEach(shimmer => shimmer.remove());
-  
+
   // Reset flag added markers
-  const containers = document.querySelectorAll('[data-flag-added]');
+  const containers = document.querySelectorAll(`[${SELECTORS.FLAG_ADDED_ATTR}]`);
   containers.forEach(container => {
     delete container.dataset.flagAdded;
   });
-  
+
   console.log('Removed all flags');
 }
 
-// Function to process all username elements on the page
+/**
+ * Process all username elements on the page and add flags
+ * Scans for tweet containers, user cells, and username elements
+ * @async
+ * @returns {Promise<void>}
+ */
 async function processUsernames() {
   // Check if extension is enabled
   if (!extensionEnabled) {
@@ -820,7 +880,7 @@ async function processUsernames() {
   }
   
   // Find all tweet/article containers and user cells
-  const containers = document.querySelectorAll('article[data-testid="tweet"], [data-testid="UserCell"], [data-testid="User-Names"], [data-testid="User-Name"]');
+  const containers = document.querySelectorAll(`${SELECTORS.TWEET}, ${SELECTORS.USER_CELL}, ${SELECTORS.USER_NAMES}, ${SELECTORS.USER_NAME}`);
   
   console.log(`Processing ${containers.length} containers for usernames`);
   
@@ -859,7 +919,11 @@ async function processUsernames() {
   }
 }
 
-// Initialize observer for dynamically loaded content
+/**
+ * Initialize MutationObserver to watch for dynamically loaded content
+ * Processes new usernames as they appear (infinite scroll, etc.)
+ * @returns {void}
+ */
 function initContentObserver() {
   if (contentObserver) {
     contentObserver.disconnect();
@@ -881,7 +945,7 @@ function initContentObserver() {
 
     if (shouldProcess) {
       // Debounce processing
-      setTimeout(processUsernames, 500);
+      setTimeout(processUsernames, CONFIG.PROCESSING.OBSERVER_DEBOUNCE_MS);
     }
   });
 
@@ -891,7 +955,11 @@ function initContentObserver() {
   });
 }
 
-// Initialize observer for navigation detection (SPA routing)
+/**
+ * Initialize MutationObserver to detect SPA navigation
+ * Reprocesses usernames when URL changes
+ * @returns {void}
+ */
 function initNavigationObserver() {
   if (navigationObserver) {
     navigationObserver.disconnect();
@@ -904,7 +972,7 @@ function initNavigationObserver() {
     if (url !== lastUrl) {
       lastUrl = url;
       console.log('Page navigation detected, reprocessing usernames');
-      setTimeout(processUsernames, 2000);
+      setTimeout(processUsernames, CONFIG.PROCESSING.RETRY_ON_NAVIGATION_DELAY_MS);
     }
   });
 
@@ -914,7 +982,10 @@ function initNavigationObserver() {
   });
 }
 
-// Cleanup observers
+/**
+ * Disconnect and cleanup all MutationObservers
+ * @returns {void}
+ */
 function cleanupObservers() {
   if (contentObserver) {
     contentObserver.disconnect();
@@ -926,7 +997,12 @@ function cleanupObservers() {
   }
 }
 
-// Main initialization
+/**
+ * Main initialization function
+ * Loads state and cache, injects page script, sets up observers
+ * @async
+ * @returns {Promise<void>}
+ */
 async function init() {
   console.log('Twitter Location Flag extension initialized');
   
@@ -948,14 +1024,14 @@ async function init() {
   // Wait a bit for page to fully load
   setTimeout(() => {
     processUsernames();
-  }, 2000);
+  }, CONFIG.PROCESSING.INITIAL_DELAY_MS);
 
   // Set up observers for new content and navigation
   initContentObserver();
   initNavigationObserver();
 
   // Save cache periodically
-  setInterval(saveCache, 30000); // Save every 30 seconds
+  setInterval(saveCache, CONFIG.CACHE.PERIODIC_SAVE_INTERVAL_MS);
 }
 
 // Cleanup on page unload
