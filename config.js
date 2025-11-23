@@ -23,6 +23,15 @@ const CONFIG = {
     CHECK_INTERVAL_MS: 60000, // Check rate limit status every minute
   },
 
+  // Retry Configuration
+  RETRY: {
+    MAX_ATTEMPTS: 3, // Maximum number of retry attempts
+    INITIAL_DELAY_MS: 1000, // Initial delay before first retry (1 second)
+    MAX_DELAY_MS: 10000, // Maximum delay between retries (10 seconds)
+    BACKOFF_MULTIPLIER: 2, // Exponential backoff multiplier
+    RETRYABLE_STATUS_CODES: [408, 500, 502, 503, 504], // HTTP status codes that should trigger retry
+  },
+
   // DOM Processing Configuration
   PROCESSING: {
     INITIAL_DELAY_MS: 2000, // Wait 2 seconds after page load

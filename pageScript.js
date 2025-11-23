@@ -13,6 +13,15 @@
     'x-twitter-client-language',
   ];
 
+  // Retry configuration (matches config.js)
+  const RETRY_CONFIG = {
+    MAX_ATTEMPTS: 3,
+    INITIAL_DELAY_MS: 1000,
+    MAX_DELAY_MS: 10000,
+    BACKOFF_MULTIPLIER: 2,
+    RETRYABLE_STATUS_CODES: [408, 500, 502, 503, 504],
+  };
+
   // Function to capture only essential headers from a request
   function captureHeaders(headers) {
     if (!headers) return;
@@ -100,13 +109,123 @@
       headersReady = true;
     }
   }, 3000);
-  
+
+  /**
+   * Fetch location with retry logic and exponential backoff
+   * @param {string} screenName - Twitter username
+   * @param {number} attempt - Current attempt number (1-indexed)
+   * @returns {Promise<{location: string|null, isRateLimited: boolean, status: number}>}
+   */
+  async function fetchLocationWithRetry(screenName, attempt = 1) {
+    const variables = JSON.stringify({ screenName });
+    const url = `https://x.com/i/api/graphql/XRqGa7EeokUU5kppkh13EA/AboutAccountQuery?variables=${encodeURIComponent(variables)}`;
+
+    // Use captured headers or minimal defaults
+    const headers = twitterHeaders || {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json'
+    };
+
+    try {
+      // Ensure credentials are included
+      const response = await fetch(url, {
+        method: 'GET',
+        credentials: 'include',
+        headers: headers,
+        referrer: window.location.href,
+        referrerPolicy: 'origin-when-cross-origin'
+      });
+
+      let location = null;
+      if (response.ok) {
+        const data = await response.json();
+        console.log(`API response for ${screenName}:`, data);
+        location = data?.data?.user_result_by_screen_name?.result?.about_profile?.account_based_in || null;
+        console.log(`Extracted location for ${screenName}:`, location);
+
+        // Debug: log the full path to see what's available
+        if (!location && data?.data?.user_result_by_screen_name?.result) {
+          console.log('User result available but no location:', {
+            hasAboutProfile: !!data.data.user_result_by_screen_name.result.about_profile,
+            aboutProfile: data.data.user_result_by_screen_name.result.about_profile
+          });
+        }
+
+        return { location, isRateLimited: false, status: response.status };
+      } else {
+        const errorText = await response.text().catch(() => '');
+
+        // Handle rate limiting
+        if (response.status === 429) {
+          const resetTime = response.headers.get('x-rate-limit-reset');
+          const remaining = response.headers.get('x-rate-limit-remaining');
+          const limit = response.headers.get('x-rate-limit-limit');
+
+          if (resetTime) {
+            const resetDate = new Date(parseInt(resetTime) * 1000);
+            const now = Date.now();
+            const waitTime = resetDate.getTime() - now;
+
+            console.log(`Rate limited! Limit: ${limit}, Remaining: ${remaining}`);
+            console.log(`Rate limit resets at: ${resetDate.toLocaleString()}`);
+            console.log(`Waiting ${Math.ceil(waitTime / 1000 / 60)} minutes before retrying...`);
+
+            // Store rate limit info for content script
+            window.postMessage({
+              type: '__rateLimitInfo',
+              resetTime: parseInt(resetTime),
+              waitTime: Math.max(0, waitTime)
+            }, '*');
+          }
+
+          return { location: null, isRateLimited: true, status: 429 };
+        }
+
+        // Check if this error is retryable
+        if (RETRY_CONFIG.RETRYABLE_STATUS_CODES.includes(response.status) && attempt < RETRY_CONFIG.MAX_ATTEMPTS) {
+          // Calculate exponential backoff delay
+          const delay = Math.min(
+            RETRY_CONFIG.INITIAL_DELAY_MS * Math.pow(RETRY_CONFIG.BACKOFF_MULTIPLIER, attempt - 1),
+            RETRY_CONFIG.MAX_DELAY_MS
+          );
+
+          console.log(`Twitter API error ${response.status} for ${screenName}, retrying in ${delay}ms (attempt ${attempt}/${RETRY_CONFIG.MAX_ATTEMPTS})`);
+
+          // Wait before retrying
+          await new Promise(resolve => setTimeout(resolve, delay));
+
+          // Retry
+          return fetchLocationWithRetry(screenName, attempt + 1);
+        }
+
+        console.log(`Twitter API error for ${screenName}:`, response.status, response.statusText, errorText.substring(0, 200));
+        return { location: null, isRateLimited: false, status: response.status };
+      }
+    } catch (error) {
+      // Network errors or fetch failures
+      if (attempt < RETRY_CONFIG.MAX_ATTEMPTS) {
+        const delay = Math.min(
+          RETRY_CONFIG.INITIAL_DELAY_MS * Math.pow(RETRY_CONFIG.BACKOFF_MULTIPLIER, attempt - 1),
+          RETRY_CONFIG.MAX_DELAY_MS
+        );
+
+        console.log(`Network error fetching location for ${screenName}, retrying in ${delay}ms (attempt ${attempt}/${RETRY_CONFIG.MAX_ATTEMPTS}):`, error.message);
+
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return fetchLocationWithRetry(screenName, attempt + 1);
+      }
+
+      console.error(`Error fetching location for ${screenName} after ${attempt} attempts:`, error);
+      throw error;
+    }
+  }
+
   // Listen for fetch requests from content script via postMessage
   window.addEventListener('message', async function(event) {
     // Only accept messages from our extension
     if (event.data && event.data.type === '__fetchLocation') {
       const { screenName, requestId } = event.data;
-      
+
       // Wait for headers to be ready
       if (!headersReady) {
         let waitCount = 0;
@@ -115,78 +234,18 @@
           waitCount++;
         }
       }
-      
+
       try {
-        const variables = JSON.stringify({ screenName });
-        const url = `https://x.com/i/api/graphql/XRqGa7EeokUU5kppkh13EA/AboutAccountQuery?variables=${encodeURIComponent(variables)}`;
-        
-        // Use captured headers or minimal defaults
-        const headers = twitterHeaders || {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json'
-        };
-        
-        // Ensure credentials are included
-        const response = await fetch(url, {
-          method: 'GET',
-          credentials: 'include',
-          headers: headers,
-          referrer: window.location.href,
-          referrerPolicy: 'origin-when-cross-origin'
-        });
-        
-        let location = null;
-        if (response.ok) {
-          const data = await response.json();
-          console.log(`API response for ${screenName}:`, data);
-          location = data?.data?.user_result_by_screen_name?.result?.about_profile?.account_based_in || null;
-          console.log(`Extracted location for ${screenName}:`, location);
-          
-          // Debug: log the full path to see what's available
-          if (!location && data?.data?.user_result_by_screen_name?.result) {
-            console.log('User result available but no location:', {
-              hasAboutProfile: !!data.data.user_result_by_screen_name.result.about_profile,
-              aboutProfile: data.data.user_result_by_screen_name.result.about_profile
-            });
-          }
-        } else {
-          const errorText = await response.text().catch(() => '');
-          
-          // Handle rate limiting
-          if (response.status === 429) {
-            const resetTime = response.headers.get('x-rate-limit-reset');
-            const remaining = response.headers.get('x-rate-limit-remaining');
-            const limit = response.headers.get('x-rate-limit-limit');
-            
-            if (resetTime) {
-              const resetDate = new Date(parseInt(resetTime) * 1000);
-              const now = Date.now();
-              const waitTime = resetDate.getTime() - now;
-              
-              console.log(`Rate limited! Limit: ${limit}, Remaining: ${remaining}`);
-              console.log(`Rate limit resets at: ${resetDate.toLocaleString()}`);
-              console.log(`Waiting ${Math.ceil(waitTime / 1000 / 60)} minutes before retrying...`);
-              
-              // Store rate limit info for content script
-              window.postMessage({
-                type: '__rateLimitInfo',
-                resetTime: parseInt(resetTime),
-                waitTime: Math.max(0, waitTime)
-              }, '*');
-            }
-          } else {
-            console.log(`Twitter API error for ${screenName}:`, response.status, response.statusText, errorText.substring(0, 200));
-          }
-        }
-        
+        const { location, isRateLimited, status } = await fetchLocationWithRetry(screenName);
+
         // Send response back to content script via postMessage
-        // Include error status so content script knows not to cache on rate limit
         window.postMessage({
           type: '__locationResponse',
           screenName,
           location,
           requestId,
-          isRateLimited: response.status === 429
+          isRateLimited,
+          status
         }, '*');
       } catch (error) {
         console.error('Error fetching location:', error);
@@ -194,7 +253,8 @@
           type: '__locationResponse',
           screenName,
           location: null,
-          requestId
+          requestId,
+          isRateLimited: false
         }, '*');
       }
     }

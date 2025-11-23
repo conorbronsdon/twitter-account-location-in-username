@@ -65,9 +65,9 @@ async function loadEnabledState() {
   try {
     const result = await chrome.storage.local.get([CONFIG.STATE.TOGGLE_KEY]);
     extensionEnabled = result[CONFIG.STATE.TOGGLE_KEY] !== undefined ? result[CONFIG.STATE.TOGGLE_KEY] : CONFIG.STATE.DEFAULT_ENABLED;
-    console.log('Extension enabled:', extensionEnabled);
+    debug.log('Extension enabled:', extensionEnabled);
   } catch (error) {
-    console.error('Error loading enabled state:', error);
+    debug.error('Error loading enabled state:', error);
     extensionEnabled = CONFIG.STATE.DEFAULT_ENABLED;
   }
 }
@@ -76,8 +76,8 @@ async function loadEnabledState() {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'extensionToggle') {
     extensionEnabled = request.enabled;
-    console.log('Extension toggled:', extensionEnabled);
-    
+    debug.log('Extension toggled:', extensionEnabled);
+
     if (extensionEnabled) {
       // Re-initialize if enabled
       setTimeout(() => {
@@ -100,7 +100,7 @@ async function loadCache() {
   try {
     // Check if extension context is still valid
     if (!chrome.runtime?.id) {
-      console.log('Extension context invalidated, skipping cache load');
+      debug.cache('Extension context invalidated, skipping cache load');
       return;
     }
 
@@ -115,15 +115,15 @@ async function loadCache() {
           locationCache.set(username, data.location);
         }
       }
-      console.log(`Loaded ${locationCache.size} cached locations (excluding null entries)`);
+      debug.cache(`Loaded ${locationCache.size} cached locations (excluding null entries)`);
     }
   } catch (error) {
     // Extension context invalidated errors are expected when extension is reloaded
     if (error.message?.includes('Extension context invalidated') ||
         error.message?.includes('message port closed')) {
-      console.log('Extension context invalidated, cache load skipped');
+      debug.cache('Extension context invalidated, cache load skipped');
     } else {
-      console.error('Error loading cache:', error);
+      debug.error('Error loading cache:', error);
     }
   }
 }
@@ -137,7 +137,7 @@ async function saveCache() {
   try {
     // Check if extension context is still valid
     if (!chrome.runtime?.id) {
-      console.log('Extension context invalidated, skipping cache save');
+      debug.cache('Extension context invalidated, skipping cache save');
       return;
     }
 
@@ -154,13 +154,14 @@ async function saveCache() {
     }
 
     await chrome.storage.local.set({ [CONFIG.CACHE.KEY]: cacheObj });
+    debug.cache(`Saved ${locationCache.size} locations to cache`);
   } catch (error) {
     // Extension context invalidated errors are expected when extension is reloaded
     if (error.message?.includes('Extension context invalidated') ||
         error.message?.includes('message port closed')) {
-      console.log('Extension context invalidated, cache save skipped');
+      debug.cache('Extension context invalidated, cache save skipped');
     } else {
-      console.error('Error saving cache:', error);
+      debug.error('Error saving cache:', error);
     }
   }
 }
@@ -175,11 +176,13 @@ async function saveCache() {
 async function saveCacheEntry(username, location) {
   // Check if extension context is still valid
   if (!chrome.runtime?.id) {
-    console.log('Extension context invalidated, skipping cache entry save');
+    debug.cache('Extension context invalidated, skipping cache entry save');
     return;
   }
-  
+
   locationCache.set(username, location);
+  debug.cache(`Cached location for ${username}: ${location}`);
+
   // Debounce saves
   if (!saveCache.timeout) {
     saveCache.timeout = setTimeout(async () => {
@@ -208,7 +211,7 @@ function injectPageScript() {
     if (event.data && event.data.type === '__rateLimitInfo') {
       rateLimitResetTime = event.data.resetTime;
       const waitTime = event.data.waitTime;
-      console.log(`Rate limit detected. Will resume requests in ${Math.ceil(waitTime / 1000 / 60)} minutes`);
+      debug.warn(`Rate limit detected. Will resume requests in ${Math.ceil(waitTime / 1000 / 60)} minutes`);
     }
   });
 }
@@ -229,12 +232,13 @@ async function processRequestQueue() {
     const now = Math.floor(Date.now() / 1000);
     if (now < rateLimitResetTime) {
       const waitTime = (rateLimitResetTime - now) * 1000;
-      console.log(`Rate limited. Waiting ${Math.ceil(waitTime / 1000 / 60)} minutes...`);
+      debug.api(`Rate limited. Waiting ${Math.ceil(waitTime / 1000 / 60)} minutes...`);
       setTimeout(processRequestQueue, Math.min(waitTime, 60000)); // Check every minute max
       return;
     } else {
       // Rate limit expired, reset
       rateLimitResetTime = 0;
+      debug.api('Rate limit expired, resuming requests');
     }
   }
   
@@ -297,26 +301,26 @@ function makeLocationRequest(screenName) {
         if (!isRateLimited) {
           saveCacheEntry(screenName, location || null);
         } else {
-          console.log(`Not caching null for ${screenName} due to rate limit`);
+          debug.cache(`Not caching null for ${screenName} due to rate limit`);
         }
         
         resolve(location || null);
       }
     };
     window.addEventListener('message', handler);
-    
+
     // Send fetch request to page script via postMessage
     window.postMessage({
       type: '__fetchLocation',
       screenName,
       requestId
     }, '*');
-    
+
     // Timeout
     setTimeout(() => {
       window.removeEventListener('message', handler);
       // Don't cache timeout failures - allow retry
-      console.log(`Request timeout for ${screenName}, not caching`);
+      debug.api(`Request timeout for ${screenName}, not caching`);
       resolve(null);
     }, CONFIG.API.TIMEOUT);
   });
@@ -334,16 +338,16 @@ async function getUserLocation(screenName) {
     const cached = locationCache.get(screenName);
     // Don't return cached null - retry if it was null before (might have been rate limited)
     if (cached !== null) {
-      console.log(`Using cached location for ${screenName}: ${cached}`);
+      debug.cache(`Using cached location for ${screenName}: ${cached}`);
       return cached;
     } else {
-      console.log(`Found null in cache for ${screenName}, will retry API call`);
+      debug.cache(`Found null in cache for ${screenName}, will retry API call`);
       // Remove from cache to allow retry
       locationCache.delete(screenName);
     }
   }
-  
-  console.log(`Queueing API request for ${screenName}`);
+
+  debug.api(`Queueing API request for ${screenName}`);
   // Queue the request
   return new Promise((resolve, reject) => {
     requestQueue.push({ screenName, resolve, reject });
@@ -580,19 +584,19 @@ async function addFlagToUsername(usernameElement, screenName) {
   }
   
   try {
-    console.log(`Processing flag for ${screenName}...`);
+    debug.flag(`Processing flag for ${screenName}...`);
 
     // Get location
     const location = await getUserLocation(screenName);
-    console.log(`Location for ${screenName}:`, location);
-    
+    debug.flag(`Location for ${screenName}:`, location);
+
     // Remove shimmer
     if (shimmerInserted && shimmerSpan.parentNode) {
       shimmerSpan.remove();
     }
-    
+
     if (!location) {
-      console.log(`No location found for ${screenName}, marking as failed`);
+      debug.flag(`No location found for ${screenName}, marking as failed`);
       usernameElement.dataset.flagAdded = 'failed';
       return;
     }
@@ -600,7 +604,7 @@ async function addFlagToUsername(usernameElement, screenName) {
   // Get flag emoji
   const flag = getCountryFlag(location);
   if (!flag) {
-    console.log(`No flag found for location: ${location}`);
+    debug.flag(`No flag found for location: ${location}`);
     // Shimmer already removed above, but ensure it's gone
     if (shimmerInserted && shimmerSpan.parentNode) {
       shimmerSpan.remove();
@@ -608,8 +612,8 @@ async function addFlagToUsername(usernameElement, screenName) {
     usernameElement.dataset.flagAdded = 'failed';
     return;
   }
-  
-  console.log(`Found flag ${flag} for ${screenName} (${location})`);
+
+  debug.flag(`Found flag ${flag} for ${screenName} (${location})`);
 
   // Find the username link - try multiple strategies
   // Priority: Find the @username link, not the display name link
@@ -625,11 +629,12 @@ async function addFlagToUsername(usernameElement, screenName) {
       const text = link.textContent?.trim();
       const href = link.getAttribute('href');
       const match = href.match(/^\/([^\/\?]+)/);
-      
+
       // Prioritize links that have @username as text
       if (match && match[1] === screenName) {
         if (text === `@${screenName}` || text === screenName) {
           usernameLink = link;
+          debug.flag(`Found username link (strategy 1) for ${screenName}`);
           break;
         }
       }
@@ -680,8 +685,8 @@ async function addFlagToUsername(usernameElement, screenName) {
   }
 
   if (!usernameLink) {
-    console.error(`Could not find username link for ${screenName}`);
-    console.error('Available links in container:', Array.from(usernameElement.querySelectorAll('a[href^="/"]')).map(l => ({
+    debug.error(`Could not find username link for ${screenName}`);
+    debug.error('Available links in container:', Array.from(usernameElement.querySelectorAll('a[href^="/"]')).map(l => ({
       href: l.getAttribute('href'),
       text: l.textContent?.trim()
     })));
@@ -692,8 +697,8 @@ async function addFlagToUsername(usernameElement, screenName) {
     usernameElement.dataset.flagAdded = 'failed';
     return;
   }
-  
-  console.log(`Found username link for ${screenName}:`, usernameLink.href, usernameLink.textContent?.trim());
+
+  debug.flag(`Found username link for ${screenName}:`, usernameLink.href, usernameLink.textContent?.trim());
 
   // Check if flag already exists (check in the entire container, not just parent)
   const existingFlag = usernameElement.querySelector(`[${SELECTORS.FLAG_ATTR}]`);
@@ -720,7 +725,7 @@ async function addFlagToUsername(usernameElement, screenName) {
   const containerForFlag = userNameContainer || usernameElement.querySelector('[data-testid="UserName"], [data-testid="User-Name"]');
   
   if (!containerForFlag) {
-    console.error(`Could not find UserName container for ${screenName}`);
+    debug.error(`Could not find UserName container for ${screenName}`);
     // Remove shimmer on error
     if (shimmerInserted && shimmerSpan.parentNode) {
       shimmerSpan.remove();
@@ -744,9 +749,9 @@ async function addFlagToUsername(usernameElement, screenName) {
     try {
       containerForFlag.insertBefore(flagSpan, handleSection);
       inserted = true;
-      console.log(`✓ Inserted flag before handle section for ${screenName}`);
+      debug.flag(`✓ Inserted flag before handle section for ${screenName}`);
     } catch (e) {
-      console.log('Failed to insert before handle section:', e);
+      debug.warn('Failed to insert before handle section:', e);
     }
   }
   
@@ -758,15 +763,15 @@ async function addFlagToUsername(usernameElement, screenName) {
       if (handleParent !== containerForFlag && handleParent.parentNode) {
         handleParent.parentNode.insertBefore(flagSpan, handleParent);
         inserted = true;
-        console.log(`✓ Inserted flag before handle parent for ${screenName}`);
+        debug.flag(`✓ Inserted flag before handle parent for ${screenName}`);
       } else if (handleParent === containerForFlag) {
         // Handle section is direct child, insert before it
         containerForFlag.insertBefore(flagSpan, handleSection);
         inserted = true;
-        console.log(`✓ Inserted flag before handle section (direct child) for ${screenName}`);
+        debug.flag(`✓ Inserted flag before handle section (direct child) for ${screenName}`);
       }
     } catch (e) {
-      console.log('Failed to insert before handle parent:', e);
+      debug.warn('Failed to insert before handle parent:', e);
     }
   }
   
@@ -783,36 +788,36 @@ async function addFlagToUsername(usernameElement, screenName) {
           if (displayNameContainer.parentNode === handleSection.parentNode) {
             displayNameContainer.parentNode.insertBefore(flagSpan, handleSection);
             inserted = true;
-            console.log(`✓ Inserted flag between display name and handle (siblings) for ${screenName}`);
+            debug.flag(`✓ Inserted flag between display name and handle (siblings) for ${screenName}`);
           } else {
             // Try inserting after display name container
             displayNameContainer.parentNode.insertBefore(flagSpan, displayNameContainer.nextSibling);
             inserted = true;
-            console.log(`✓ Inserted flag after display name container for ${screenName}`);
+            debug.flag(`✓ Inserted flag after display name container for ${screenName}`);
           }
         }
       }
     } catch (e) {
-      console.log('Failed to insert after display name:', e);
+      debug.warn('Failed to insert after display name:', e);
     }
   }
-  
+
   // Strategy 4: Insert at the end of User-Name container (fallback)
   if (!inserted) {
     try {
       containerForFlag.appendChild(flagSpan);
       inserted = true;
-      console.log(`✓ Inserted flag at end of UserName container for ${screenName}`);
+      debug.flag(`✓ Inserted flag at end of UserName container for ${screenName}`);
     } catch (e) {
-      console.error('Failed to append flag to User-Name container:', e);
+      debug.error('Failed to append flag to User-Name container:', e);
     }
   }
   
     if (inserted) {
       // Mark as processed
       usernameElement.dataset.flagAdded = 'true';
-      console.log(`✓ Successfully added flag ${flag} for ${screenName} (${location})`);
-      
+      debug.flag(`✓ Successfully added flag ${flag} for ${screenName} (${location})`);
+
       // Also mark any other containers waiting for this username
       const waitingContainers = document.querySelectorAll(`[data-flag-added="waiting"]`);
       waitingContainers.forEach(container => {
@@ -823,9 +828,9 @@ async function addFlagToUsername(usernameElement, screenName) {
         }
       });
     } else {
-      console.error(`✗ Failed to insert flag for ${screenName} - tried all strategies`);
-      console.error('Username link:', usernameLink);
-      console.error('Parent structure:', usernameLink.parentNode);
+      debug.error(`✗ Failed to insert flag for ${screenName} - tried all strategies`);
+      debug.error('Username link:', usernameLink);
+      debug.error('Parent structure:', usernameLink.parentNode);
       // Remove shimmer on failure
       if (shimmerInserted && shimmerSpan.parentNode) {
         shimmerSpan.remove();
@@ -833,7 +838,7 @@ async function addFlagToUsername(usernameElement, screenName) {
       usernameElement.dataset.flagAdded = 'failed';
     }
   } catch (error) {
-    console.error(`Error processing flag for ${screenName}:`, error);
+    debug.error(`Error processing flag for ${screenName}:`, error);
     // Remove shimmer on error
     if (shimmerInserted && shimmerSpan.parentNode) {
       shimmerSpan.remove();
@@ -864,7 +869,7 @@ function removeAllFlags() {
     delete container.dataset.flagAdded;
   });
 
-  console.log('Removed all flags');
+  debug.log('Removed all flags');
 }
 
 /**
@@ -881,23 +886,24 @@ async function processUsernames() {
   
   // Find all tweet/article containers and user cells
   const containers = document.querySelectorAll(`${SELECTORS.TWEET}, ${SELECTORS.USER_CELL}, ${SELECTORS.USER_NAMES}, ${SELECTORS.USER_NAME}`);
-  
-  console.log(`Processing ${containers.length} containers for usernames`);
-  
+
+  debug.log(`Processing ${containers.length} containers for usernames`);
+
   let foundCount = 0;
   let processedCount = 0;
   let skippedCount = 0;
-  
+
   for (const container of containers) {
     const screenName = extractUsername(container);
     if (screenName) {
       foundCount++;
+      debug.username(`Extracted username: ${screenName}`);
       const status = container.dataset.flagAdded;
       if (!status || status === 'failed') {
         processedCount++;
         // Process in parallel but limit concurrency
         addFlagToUsername(container, screenName).catch(err => {
-          console.error(`Error processing ${screenName}:`, err);
+          debug.error(`Error processing ${screenName}:`, err);
           container.dataset.flagAdded = 'failed';
         });
       } else {
@@ -907,15 +913,15 @@ async function processUsernames() {
       // Debug: log containers that don't have usernames
       const hasUserName = container.querySelector('[data-testid="UserName"], [data-testid="User-Name"]');
       if (hasUserName) {
-        console.log('Found UserName container but no username extracted');
+        debug.username('Found UserName container but no username extracted');
       }
     }
   }
-  
+
   if (foundCount > 0) {
-    console.log(`Found ${foundCount} usernames, processing ${processedCount} new ones, skipped ${skippedCount} already processed`);
+    debug.log(`Found ${foundCount} usernames, processing ${processedCount} new ones, skipped ${skippedCount} already processed`);
   } else {
-    console.log('No usernames found in containers');
+    debug.log('No usernames found in containers');
   }
 }
 
@@ -971,7 +977,7 @@ function initNavigationObserver() {
     const url = location.href;
     if (url !== lastUrl) {
       lastUrl = url;
-      console.log('Page navigation detected, reprocessing usernames');
+      debug.log('Page navigation detected, reprocessing usernames');
       setTimeout(processUsernames, CONFIG.PROCESSING.RETRY_ON_NAVIGATION_DELAY_MS);
     }
   });
@@ -1004,17 +1010,17 @@ function cleanupObservers() {
  * @returns {Promise<void>}
  */
 async function init() {
-  console.log('Twitter Location Flag extension initialized');
-  
+  debug.log('Twitter Location Flag extension initialized');
+
   // Load enabled state first
   await loadEnabledState();
-  
+
   // Load persistent cache
   await loadCache();
-  
+
   // Only proceed if extension is enabled
   if (!extensionEnabled) {
-    console.log('Extension is disabled');
+    debug.log('Extension is disabled');
     return;
   }
   
